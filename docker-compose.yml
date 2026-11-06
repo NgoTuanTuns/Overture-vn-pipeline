@@ -1,0 +1,14 @@
+services:
+  dev:
+    build: .
+    working_dir: /workspace
+    environment:
+      PYTHONPATH: /workspace/transform # lets scripts import spark_session
+    ports:
+      - "4040:4040" # Spark UI
+    volumes:
+      - .:/workspace # code and data live in your project folder
+      - ivy-cache:/root/.ivy2 # cache Delta jars so they are not re-downloaded
+
+volumes:
+  ivy-cache:

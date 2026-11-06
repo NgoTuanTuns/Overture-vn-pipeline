@@ -1,0 +1,11 @@
+[project]
+name = "overture-vn-pipeline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "delta-spark==3.3.*",
+    "duckdb>=2.0.0",
+    "pyspark==3.5.*",
+]
