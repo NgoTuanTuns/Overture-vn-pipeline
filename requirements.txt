@@ -3,3 +3,4 @@ pyspark==3.5.*
 delta-spark==3.3.*
 pytest
 ruff
+pyyaml

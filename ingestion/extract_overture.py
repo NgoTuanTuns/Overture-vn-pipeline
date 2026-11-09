@@ -1,45 +1,56 @@
-"""In this script I pull one Overture theme for Vietnam into the bronze layer.
+"""Extract Overture themes for Vietnam into the bronze layer.
 
-I keep the data raw on purpose: I only add two metadata columns, so any cleaning
-bug in a later layer can be fixed by re-running from bronze without re-downloading.
+Bronze stays raw: the only additions are lineage columns, so cleaning bugs in
+later layers can be fixed by re-running from here without re-downloading.
 """
 import argparse
+import logging
 import os
 import pathlib
+import time
 
 import duckdb
+import yaml
 
-# I use a rough bounding box here because bbox filtering is cheap on GeoParquet.
-# The exact Vietnam boundary is applied later in the silver layer.
-VN_BBOX = {"xmin": 102.1, "xmax": 109.5, "ymin": 8.4, "ymax": 23.4}
+from ingest_log import log_run
 
-# Hive-style paths of the Overture themes I support so far
-THEMES = {
-    "places": "theme=places/type=place",
-}
+CONFIG_PATH = pathlib.Path("config/settings.yaml")
 
 
-def extract(release: str, theme: str, out_root: str) -> pathlib.Path:
-    """I extract one theme of one release and write it as a single bronze Parquet file."""
-    # I use an in-memory DuckDB; nothing is persisted besides the output Parquet file
+def load_config(path: pathlib.Path = CONFIG_PATH) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def source_glob(release: str, theme: str, cfg: dict) -> str:
+    """S3 glob for one theme of one Overture release."""
+    return f"s3://overturemaps-us-west-2/release/{release}/{cfg['themes'][theme]}/*"
+
+
+def bronze_path(release: str, theme: str, cfg: dict) -> pathlib.Path:
+    """Final bronze file location for one theme of one release."""
+    return (
+        pathlib.Path(cfg["bronze_root"]) / theme / f"release={release}" / "part-0.parquet"
+    )
+
+
+def extract(release: str, theme: str, cfg: dict, src: str | None = None) -> pathlib.Path:
+    """Write one theme of one release as a single bronze Parquet file.
+
+    `src` overrides the S3 location; tests use it to read a small local file.
+    """
     con = duckdb.connect()
     con.sql("INSTALL httpfs; LOAD httpfs;")
     con.sql("INSTALL spatial; LOAD spatial;")
-    # The Overture bucket lives in us-west-2 and is public, so no credentials are needed
-    con.sql("SET s3_region='us-west-2';")
+    con.sql("SET s3_region='us-west-2';")  # public bucket, no credentials needed
 
-    src = f"s3://overturemaps-us-west-2/release/{release}/{THEMES[theme]}/*"
+    src = src or source_glob(release, theme, cfg)
 
-    # I partition the output by release so every release is an independent unit
-    # that can be backfilled or re-run on its own
-    out_dir = pathlib.Path(out_root) / theme / f"release={release}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    final = bronze_path(release, theme, cfg)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    tmp = final.with_suffix(".parquet.tmp")
 
-    tmp = out_dir / "part-0.parquet.tmp"
-    final = out_dir / "part-0.parquet"
-
-    b = VN_BBOX
-    # I add _release and _ingested_at so every row can be traced back to its source run
+    b = cfg["bbox"]
     con.sql(f"""
         COPY (
             SELECT *,
@@ -51,23 +62,42 @@ def extract(release: str, theme: str, out_root: str) -> pathlib.Path:
         ) TO '{tmp}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
     """)
 
-    # I write to a temp file and rename it afterwards, so a failed run never leaves
-    # a half-written file behind and re-running the same release is idempotent
+    # Rename after a complete write so a failed run never leaves a partial file;
+    # this also makes re-running the same release idempotent.
     tmp.replace(final)
     return final
 
 
-if __name__ == "__main__":
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = load_config()
+
     p = argparse.ArgumentParser()
-    # I fall back to the OVERTURE_RELEASE env var so the release can come from config
     p.add_argument(
-        "--release",
-        default=os.environ.get("OVERTURE_RELEASE"),
-        help="Overture release, e.g. 2026-10-21.0 (defaults to $OVERTURE_RELEASE)",
+        "--release", nargs="+",
+        default=[os.environ["OVERTURE_RELEASE"]] if os.environ.get("OVERTURE_RELEASE") else cfg["releases"],
+        help="one or more releases (defaults to $OVERTURE_RELEASE, then config)",
     )
-    p.add_argument("--theme", default="places", choices=THEMES.keys())
-    p.add_argument("--out", default="data/bronze")
+    p.add_argument(
+        "--theme", nargs="+", default=list(cfg["themes"]), choices=list(cfg["themes"]),
+        help="themes to extract (defaults to all in config)",
+    )
     args = p.parse_args()
-    if not args.release:
-        p.error("--release is required (or set OVERTURE_RELEASE)")
-    print("Wrote", extract(args.release, args.theme, args.out))
+
+    for release in args.release:
+        for theme in args.theme:
+            started = time.perf_counter()
+            try:
+                path = extract(release, theme, cfg)
+            except Exception as exc:
+                log_run("release", theme, release, "failed", time.perf_counter() - started, error=str(exc))
+                raise
+            duration = time.perf_counter() - started
+            log_run("release", theme, release, "ok", duration, path)
+            logging.info(
+                "release=%s theme=%s file=%s duration_s=%.1f", release, theme, path, duration
+            )
+
+
+if __name__ == "__main__":
+    main()
